@@ -132,6 +132,7 @@ static void convertSplats(std::vector<Attr>& position, std::vector<Attr>& rotati
 			rotation[i].f[k] /= ql;
 
 		// for SH conversion, since coordinate space xform is flipping Y & Z, we need to flip coefficients for bands that encode odd-length products of Y & Z
+		// real SH basis (Condon-Shortley): band 1 flips m=0,1 (-Y,+Z), band 2 flips m=1 (YZ), band 3 flips m=0 (3x2y-y3), m=2 (y(5z2-r2)), m=3 (z(5z2-3r2))
 		for (int k = 0; k < 3; ++k)
 		{
 			if (shdim >= 1)
@@ -142,8 +143,7 @@ static void convertSplats(std::vector<Attr>& position, std::vector<Attr>& rotati
 
 			if (shdim >= 2)
 			{
-				sh2[0][i].f[k] *= -1;
-				sh2[3][i].f[k] *= -1;
+				sh2[1][i].f[k] *= -1;
 			}
 
 			if (shdim >= 3)
@@ -151,7 +151,6 @@ static void convertSplats(std::vector<Attr>& position, std::vector<Attr>& rotati
 				sh3[0][i].f[k] *= -1;
 				sh3[2][i].f[k] *= -1;
 				sh3[3][i].f[k] *= -1;
-				sh3[5][i].f[k] *= -1;
 			}
 		}
 	}
