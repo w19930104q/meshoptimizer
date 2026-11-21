@@ -1589,6 +1589,203 @@ static void meshletsSpatialDeep()
 	assert(result == N);
 }
 
+static void meshletsOutliers()
+{
+	const int grid = 16;
+	const int base_vertices = grid * grid;
+	const int base_triangles = (grid - 1) * (grid - 1) * 2;
+	const size_t max_vertices = 64;
+	const size_t max_triangles = 64;
+
+	// outlier counts cover single points, KD leaf boundary (8) and larger groups; directions cover all three axes and both signs
+	const int outlier_counts[] = {1, 2, 3, 7, 8, 9, 16, 33, 100};
+	const float outlier_magnitudes[] = {1e6f, 1e12f, 1e20f};
+
+	for (size_t ci = 0; ci < sizeof(outlier_counts) / sizeof(outlier_counts[0]); ++ci)
+	{
+		int outliers = outlier_counts[ci];
+
+		for (size_t mi = 0; mi < sizeof(outlier_magnitudes) / sizeof(outlier_magnitudes[0]); ++mi)
+		{
+			float magnitude = outlier_magnitudes[mi];
+
+			int vertex_count = base_vertices + outliers * 3;
+			int triangle_count = base_triangles + outliers;
+
+			std::vector<float> vb(vertex_count * 3);
+			std::vector<unsigned int> ib(triangle_count * 3);
+
+			// regular grid of base vertices
+			for (int y = 0; y < grid; ++y)
+				for (int x = 0; x < grid; ++x)
+				{
+					vb[(y * grid + x) * 3 + 0] = float(x);
+					vb[(y * grid + x) * 3 + 1] = float(y);
+					vb[(y * grid + x) * 3 + 2] = 0.f;
+				}
+
+			int t = 0;
+			for (int y = 0; y < grid - 1; ++y)
+				for (int x = 0; x < grid - 1; ++x)
+				{
+					unsigned int a = y * grid + x, b = a + 1, c = a + grid, d = c + 1;
+					ib[t * 3 + 0] = a;
+					ib[t * 3 + 1] = b;
+					ib[t * 3 + 2] = c;
+					ib[t * 3 + 3] = c;
+					ib[t * 3 + 4] = b;
+					ib[t * 3 + 5] = d;
+					t += 2;
+				}
+
+			// disconnected outlier triangles spread across axes, directions and magnitudes
+			for (int i = 0; i < outliers; ++i)
+			{
+				unsigned int v0 = base_vertices + i * 3;
+				int axis = i % 3;
+				float sign = (i & 1) ? -1.f : 1.f;
+				float distance = sign * magnitude * (1.f + float(i % 7) * 0.01f);
+
+				for (int k = 0; k < 3; ++k)
+				{
+					vb[(v0 + k) * 3 + 0] = axis == 0 ? distance + float(k) : float(k);
+					vb[(v0 + k) * 3 + 1] = axis == 1 ? distance + (k == 1) : float(k == 1);
+					vb[(v0 + k) * 3 + 2] = axis == 2 ? distance : 0.f;
+				}
+
+				ib[t * 3 + 0] = v0 + 0;
+				ib[t * 3 + 1] = v0 + 1;
+				ib[t * 3 + 2] = v0 + 2;
+				t++;
+			}
+
+			assert(t == triangle_count);
+
+			size_t max_meshlets = meshopt_buildMeshletsBound(triangle_count * 3, max_vertices, max_triangles);
+			std::vector<meshopt_Meshlet> meshlets(max_meshlets);
+			std::vector<unsigned int> meshlet_vertices(triangle_count * 3);
+			std::vector<unsigned char> meshlet_triangles(triangle_count * 3);
+
+			size_t result = meshopt_buildMeshlets(&meshlets[0], &meshlet_vertices[0], &meshlet_triangles[0], &ib[0], triangle_count * 3, &vb[0], vertex_count, sizeof(float) * 3, max_vertices, max_triangles, 0.f);
+			assert(result > 0 && result <= max_meshlets);
+
+			// every emitted meshlet must respect the advertised limits, and no input triangle may be dropped
+			size_t emitted_triangles = 0;
+
+			for (size_t i = 0; i < result; ++i)
+			{
+				assert(meshlets[i].vertex_count <= max_vertices);
+				assert(meshlets[i].triangle_count <= max_triangles);
+
+				for (unsigned int k = 0; k < meshlets[i].triangle_count * 3; ++k)
+					assert(meshlet_triangles[meshlets[i].triangle_offset + k] < meshlets[i].vertex_count);
+
+				emitted_triangles += meshlets[i].triangle_count;
+			}
+
+			assert(emitted_triangles == size_t(triangle_count));
+		}
+	}
+}
+
+static void meshletsCoincidentExtremes()
+{
+	// two groups of triangles at positions whose squared distance overflows float; previously the nearest
+	// neighbor search pruned the distant group and silently dropped half of the input triangles
+	const int n = 100;
+	const size_t max_vertices = 64;
+	const size_t max_triangles = 64;
+
+	std::vector<float> vb(n * 3 * 3);
+	std::vector<unsigned int> ib(n * 3);
+
+	for (int i = 0; i < n; ++i)
+	{
+		float px = (i < n / 2) ? 0.f : 1e20f;
+
+		for (int k = 0; k < 3; ++k)
+		{
+			vb[(i * 3 + k) * 3 + 0] = px + (k == 1);
+			vb[(i * 3 + k) * 3 + 1] = float(k == 2);
+			vb[(i * 3 + k) * 3 + 2] = 0.f;
+		}
+
+		ib[i * 3 + 0] = i * 3 + 0;
+		ib[i * 3 + 1] = i * 3 + 1;
+		ib[i * 3 + 2] = i * 3 + 2;
+	}
+
+	size_t max_meshlets = meshopt_buildMeshletsBound(n * 3, max_vertices, max_triangles);
+	std::vector<meshopt_Meshlet> meshlets(max_meshlets);
+	std::vector<unsigned int> meshlet_vertices(n * 3);
+	std::vector<unsigned char> meshlet_triangles(n * 3);
+
+	size_t result = meshopt_buildMeshlets(&meshlets[0], &meshlet_vertices[0], &meshlet_triangles[0], &ib[0], n * 3, &vb[0], n * 3, sizeof(float) * 3, max_vertices, max_triangles, 0.f);
+
+	size_t emitted_triangles = 0;
+
+	for (size_t i = 0; i < result; ++i)
+	{
+		assert(meshlets[i].vertex_count <= max_vertices);
+		assert(meshlets[i].triangle_count <= max_triangles);
+		emitted_triangles += meshlets[i].triangle_count;
+	}
+
+	assert(emitted_triangles == size_t(n));
+}
+
+static void meshletsNonFiniteCoordinates()
+{
+	// coordinates beyond FLT_MAX collapse to infinity and centroid math can produce NaN; the builder must
+	// sanitize these instead of dropping triangles or producing oversized meshlets
+	const int n = 200;
+	const size_t max_vertices = 64;
+	const size_t max_triangles = 64;
+
+	const float extremes[] = {INFINITY, -INFINITY};
+
+	for (size_t e = 0; e < sizeof(extremes) / sizeof(extremes[0]); ++e)
+	{
+		std::vector<float> vb(n * 3 * 3);
+		std::vector<unsigned int> ib(n * 3);
+
+		for (int i = 0; i < n; ++i)
+		{
+			// a finite core plus a group of triangles placed at and around the non-finite extreme
+			float px = (i < n / 2) ? float(i % 8) : extremes[e];
+
+			for (int k = 0; k < 3; ++k)
+			{
+				vb[(i * 3 + k) * 3 + 0] = px + (k == 1);
+				vb[(i * 3 + k) * 3 + 1] = float(k == 2);
+				vb[(i * 3 + k) * 3 + 2] = 0.f;
+			}
+
+			ib[i * 3 + 0] = i * 3 + 0;
+			ib[i * 3 + 1] = i * 3 + 1;
+			ib[i * 3 + 2] = i * 3 + 2;
+		}
+
+		size_t max_meshlets = meshopt_buildMeshletsBound(n * 3, max_vertices, max_triangles);
+		std::vector<meshopt_Meshlet> meshlets(max_meshlets);
+		std::vector<unsigned int> meshlet_vertices(n * 3);
+		std::vector<unsigned char> meshlet_triangles(n * 3);
+
+		size_t result = meshopt_buildMeshlets(&meshlets[0], &meshlet_vertices[0], &meshlet_triangles[0], &ib[0], n * 3, &vb[0], n * 3, sizeof(float) * 3, max_vertices, max_triangles, 0.f);
+
+		size_t emitted_triangles = 0;
+
+		for (size_t i = 0; i < result; ++i)
+		{
+			assert(meshlets[i].vertex_count <= max_vertices);
+			assert(meshlets[i].triangle_count <= max_triangles);
+			emitted_triangles += meshlets[i].triangle_count;
+		}
+
+		assert(emitted_triangles == size_t(n));
+	}
+}
+
 static void partitionBasic()
 {
 	// 0   1   2
@@ -3666,6 +3863,9 @@ void runTests()
 	meshletsMax();
 	meshletsSpatial();
 	meshletsSpatialDeep();
+	meshletsOutliers();
+	meshletsCoincidentExtremes();
+	meshletsNonFiniteCoordinates();
 
 	partitionBasic();
 	partitionSpatial();

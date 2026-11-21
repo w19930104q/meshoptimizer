@@ -198,6 +198,17 @@ static Cone getMeshletCone(const Cone& acc, unsigned int triangle_count)
 	return result;
 }
 
+// Coordinates outside the finite float range (infinity, or NaN produced by combining infinities when computing
+// the centroid) break spatial partitioning and nearest neighbor search. Clamp them to a finite extreme while
+// preserving the sign, which keeps the relative ordering and makes every downstream comparison well defined.
+static float sanitizeCoordinate(float value)
+{
+	if (isfinite(value))
+		return value;
+
+	return value < 0.f ? -FLT_MAX : FLT_MAX;
+}
+
 static float computeTriangleCones(Cone* triangles, const unsigned int* indices, size_t index_count, const float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride)
 {
 	(void)vertex_count;
@@ -226,9 +237,9 @@ static float computeTriangleCones(Cone* triangles, const unsigned int* indices, 
 		float area = sqrtf(normalx * normalx + normaly * normaly + normalz * normalz);
 		float invarea = (area == 0.f) ? 0.f : 1.f / area;
 
-		triangles[i].px = (p0[0] + p1[0] + p2[0]) / 3.f;
-		triangles[i].py = (p0[1] + p1[1] + p2[1]) / 3.f;
-		triangles[i].pz = (p0[2] + p1[2] + p2[2]) / 3.f;
+		triangles[i].px = sanitizeCoordinate((p0[0] + p1[0] + p2[0]) / 3.f);
+		triangles[i].py = sanitizeCoordinate((p0[1] + p1[1] + p2[1]) / 3.f);
+		triangles[i].pz = sanitizeCoordinate((p0[2] + p1[2] + p2[2]) / 3.f);
 
 		triangles[i].nx = normalx * invarea;
 		triangles[i].ny = normaly * invarea;
@@ -529,6 +540,152 @@ static size_t kdtreeBuildLeaf(size_t offset, KDNode* nodes, size_t node_count, u
 	return offset + count;
 }
 
+// Select the median coordinate value on the given axis using quickselect; the indices array is reordered in place.
+// Used only when the tree reaches its depth limit, where a spatially correct and balanced split is required.
+static float kdtreeMedianValue(unsigned int* indices, size_t count, const float* points, size_t stride, int axis)
+{
+	size_t lo = 0, hi = count;
+	size_t target = count / 2;
+
+	while (hi - lo > 1)
+	{
+		// median-of-three pivot value reduces the chance of a bad partition on skewed data
+		size_t mid = lo + (hi - lo) / 2;
+
+		float vlo = points[indices[lo] * stride + axis];
+		float vmid = points[indices[mid] * stride + axis];
+		float vhi = points[indices[hi - 1] * stride + axis];
+
+		float pivot = vmid;
+
+		if ((vmid <= vlo && vlo <= vhi) || (vhi <= vlo && vlo <= vmid))
+			pivot = vlo;
+		else if ((vlo <= vhi && vhi <= vmid) || (vmid <= vhi && vhi <= vlo))
+			pivot = vhi;
+
+		// three-way partition [lo, hi) into values < pivot, values == pivot, values > pivot
+		size_t lt = lo, gt = hi, k = lo;
+
+		while (k < gt)
+		{
+			float v = points[indices[k] * stride + axis];
+
+			if (v < pivot)
+			{
+				unsigned int t = indices[lt];
+				indices[lt] = indices[k];
+				indices[k] = t;
+				++lt;
+				++k;
+			}
+			else if (v > pivot)
+			{
+				--gt;
+				unsigned int t = indices[gt];
+				indices[gt] = indices[k];
+				indices[k] = t;
+			}
+			else
+			{
+				++k;
+			}
+		}
+
+		// [lo, lt) < pivot, [lt, gt) == pivot, [gt, hi) > pivot; the equal block guarantees termination
+		if (target < lt)
+			hi = lt;
+		else if (target >= gt)
+			lo = gt;
+		else
+			return pivot;
+	}
+
+	return points[indices[target] * stride + axis];
+}
+
+// Force a balanced, spatially correct partition once the tree depth limit is reached.
+// Returns true and fills split_axis/split_value/middle; false only when the points are coincident on every axis.
+static bool kdtreePartitionBalanced(unsigned int* indices, size_t count, const float* points, size_t stride, int preferred, int& split_axis, float& split_value, size_t& middle)
+{
+	for (int a = 0; a < 3; ++a)
+	{
+		int axis = (preferred + a) % 3;
+
+		float min = FLT_MAX, max = -FLT_MAX;
+
+		for (size_t i = 0; i < count; ++i)
+		{
+			float v = points[indices[i] * stride + axis];
+			min = v < min ? v : min;
+			max = v > max ? v : max;
+		}
+
+		// coincident coordinates on this axis can't produce a split
+		if (!(min < max))
+			continue;
+
+		float pivot = kdtreeMedianValue(indices, count, points, stride, axis);
+		size_t partition = kdtreePartition(indices, count, points, stride, axis, pivot);
+
+		if (partition != 0 && partition != count)
+		{
+			split_axis = axis;
+			split_value = pivot;
+			middle = partition;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+// Force a non-degenerate partition of a subtree that the mean-based split could not divide.
+// Returns true and fills split_axis/split_value/middle on success. When every point is coincident
+// on all axes no spatial split exists, and the caller splits the index range in half instead.
+static bool kdtreePartitionForced(unsigned int* indices, size_t count, const float* points, size_t stride, int preferred, int& split_axis, float& split_value, size_t& middle)
+{
+	for (int a = 0; a < 3; ++a)
+	{
+		int axis = (preferred + a) % 3;
+
+		float min = FLT_MAX, max = -FLT_MAX;
+
+		for (size_t i = 0; i < count; ++i)
+		{
+			float v = points[indices[i] * stride + axis];
+			min = v < min ? v : min;
+			max = v > max ? v : max;
+		}
+
+		// coincident coordinates on this axis can't produce a split
+		if (!(min < max))
+			continue;
+
+		// pivot on the smallest value that differs from the minimum; points at the minimum go left, all others go right
+		float pivot = FLT_MAX;
+
+		for (size_t i = 0; i < count; ++i)
+		{
+			float v = points[indices[i] * stride + axis];
+
+			if (v > min && v < pivot)
+				pivot = v;
+		}
+
+		size_t partition = kdtreePartition(indices, count, points, stride, axis, pivot);
+
+		if (partition != 0 && partition != count)
+		{
+			split_axis = axis;
+			split_value = pivot;
+			middle = partition;
+			return true;
+		}
+	}
+
+	return false;
+}
+
 static size_t kdtreeBuild(size_t offset, KDNode* nodes, size_t node_count, const float* points, size_t stride, unsigned int* indices, size_t count, size_t leaf_size, int depth)
 {
 	assert(count > 0);
@@ -560,20 +717,65 @@ static size_t kdtreeBuild(size_t offset, KDNode* nodes, size_t node_count, const
 	float split = mean[axis];
 	size_t middle = kdtreePartition(indices, count, points, stride, axis, split);
 
-	// when the partition is degenerate, consolidate the points into a single node; also ensure recursion depth is bounded on pathological inputs
-	if (middle == 0 || middle == count || depth >= kMeshletMaxTreeDepth)
+	// a mean partition is degenerate when outlier coordinates skew the mean past every point, or when all
+	// coordinates on the split axis coincide; such a partition puts every point on a single side
+	bool degenerate = middle == 0 || middle == count;
+
+	// small subtrees keep the original consolidation heuristics, which bounds every leaf to leaf_size*8 points
+	if (count <= leaf_size * 8 &&
+	    (degenerate || depth >= kMeshletMaxTreeDepth || (middle <= leaf_size / 2 || middle >= count - leaf_size / 2)))
 		return kdtreeBuildLeaf(offset, nodes, node_count, indices, count);
 
-	// when the partition is unbalanced, consolidate the points into a single small node; large nodes are still split to prevent outlier points from creating very large leaves
-	if ((middle <= leaf_size / 2 || middle >= count - leaf_size / 2) && count <= leaf_size * 8)
-		return kdtreeBuildLeaf(offset, nodes, node_count, indices, count);
+	// large subtrees must never collapse into an oversized leaf; the depth limit takes precedence so that
+	// degenerate peels can never extend the tree past a guaranteed number of balanced levels
+	if (depth >= kMeshletMaxTreeDepth)
+	{
+		// force a balanced spatial split so the remaining levels converge logarithmically without violating
+		// the spatial separation invariant
+		int split_axis;
+		float split_value;
+		size_t balanced;
+
+		if (kdtreePartitionBalanced(indices, count, points, stride, axis, split_axis, split_value, balanced))
+		{
+			axis = split_axis;
+			split = split_value;
+			middle = balanced;
+		}
+		else
+		{
+			// all points are coincident on every axis; halve the index range and keep the split plane on the shared coordinate
+			split = points[indices[0] * stride + axis];
+			middle = count / 2;
+		}
+	}
+	else if (degenerate)
+	{
+		int split_axis;
+		float split_value;
+		size_t forced;
+
+		if (kdtreePartitionForced(indices, count, points, stride, axis, split_axis, split_value, forced))
+		{
+			axis = split_axis;
+			split = split_value;
+			middle = forced;
+		}
+		else
+		{
+			// all points are coincident on every axis, so there is no spatial split; divide the index range in half.
+			// the split plane is placed on the shared coordinate so nearest-neighbor traversal never prunes a subtree.
+			split = points[indices[0] * stride + axis];
+			middle = count / 2;
+		}
+	}
 
 	KDNode& result = nodes[offset];
 
 	result.split = split;
 	result.axis = axis;
 
-	// left subtree is right after our node
+	// left subtree is right after our node; every path above guarantees both sides are non-empty, so this always shrinks
 	size_t next_offset = kdtreeBuild(offset + 1, nodes, node_count, points, stride, indices, middle, leaf_size, depth + 1);
 
 	// distance to the right subtree is represented explicitly
@@ -606,10 +808,20 @@ static void kdtreeNearest(KDNode* nodes, unsigned int root, const float* points,
 
 			const float* point = points + index * stride;
 
-			float dx = point[0] - position[0], dy = point[1] - position[1], dz = point[2] - position[2];
-			float distance = sqrtf(dx * dx + dy * dy + dz * dz);
+			// accumulate in double precision: with extreme coordinate spread the squared distance can exceed FLT_MAX
+			// and become infinite, which would make every finite candidate fail the limit comparison below
+			double dx = double(point[0]) - double(position[0]);
+			double dy = double(point[1]) - double(position[1]);
+			double dz = double(point[2]) - double(position[2]);
+			double distance64 = sqrt(dx * dx + dy * dy + dz * dz);
 
-			if (distance < limit)
+			// saturate at FLT_MAX so that the distance remains a usable finite bound even for the largest coordinates;
+			// NaN (e.g. infinities on both sides) is treated the same way rather than silently rejecting the candidate
+			float distance = (distance64 >= double(FLT_MAX) || distance64 != distance64) ? FLT_MAX : float(distance64);
+
+			// a saturated distance is a sentinel rather than a real upper bound, so while it is in effect accept every
+			// un-emitted point (the first one wins); finite distances still require a strict improvement
+			if (distance == FLT_MAX ? result == ~0u : distance < limit)
 			{
 				result = index;
 				limit = distance;
@@ -632,11 +844,22 @@ static void kdtreeNearest(KDNode* nodes, unsigned int root, const float* points,
 		if ((nodes[root + 1 + first].children | nodes[root + 1 + second].children) == 0)
 			nodes[root].children = 0;
 
+		// remember whether the first subtree produced a candidate; it doesn't when every candidate is already emitted
+		unsigned int first_result = result;
+
 		// recursion depth is bounded by tree depth (which is limited by construction)
 		kdtreeNearest(nodes, root + 1 + first, points, stride, emitted_flags, position, result, limit);
 
 		// only process the other node if it can have a match based on closest distance so far
-		if (fabsf(delta) <= limit)
+		// saturate the plane distance to FLT_MAX to match the leaf distance saturation above; otherwise split planes
+		// at infinite or non-finite coordinates (inputs beyond FLT_MAX) would prune a subtree that still holds emit candidates
+		float plane_distance = fabsf(delta);
+
+		if (!(plane_distance <= FLT_MAX))
+			plane_distance = FLT_MAX;
+
+		// when no candidate was found the limit is still infinite, so the other subtree must be searched unconditionally
+		if (result != first_result || plane_distance <= limit)
 			kdtreeNearest(nodes, root + 1 + second, points, stride, emitted_flags, position, result, limit);
 	}
 }
